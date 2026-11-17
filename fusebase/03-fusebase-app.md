@@ -1,30 +1,24 @@
-# 03 — FuseBase app
+# 03 — FuseBase app (LIVE)
 
-```bash
-mkdir pocketlens-fusebase-app && cd pocketlens-fusebase-app
-fusebase init            # org Sans Titre, product "PocketLens"
-```
+The app is already registered and deployed in the Sans Titre FuseBase organization.
 
-Copy the SPA in, keeping the scaffold's build config:
+- Product: `PocketLens` (`xmxwx6qkgetfavfm`)
+- App: `PocketLens` (`7pgixih7yyu9ahyz`)
+- URL: https://pocketlens.thefusebase.app/
+- Access: visitor, organization member, manager and owner
 
-```bash
-cp -R ../pocketlens-fusebase/web/src ./src
-cp ../pocketlens-fusebase/web/index.html .
-cp ../pocketlens-fusebase/web/tailwind.config.ts .
-cp ../pocketlens-fusebase/web/postcss.config.js .
-```
+Verification: opened the live URL in an authenticated Chrome session. The React SPA rendered
+its full dashboard (Home, Transactions, Budget, Explore, Balances, Settings), demo data, and
+no error screen. The build has `VITE_SUPABASE_URL` and public anon key configured; backend
+URL currently points at Render placeholder `https://pocketlens-api.onrender.com` until the
+Python sync API is deployed.
 
-Keep the scaffold's `package.json`, `vite.config.ts` and `tsconfig`: they carry FuseBase's
-base path, auth bootstrap and build output. Merge PocketLens dependencies into it:
-`@supabase/supabase-js`, `@tanstack/react-query`, `react-router-dom`, `recharts`,
-`framer-motion`, `sonner`, `next-themes`, `lucide-react`, and the Radix packages.
-
-Create `.env` from `env.fusebase.example`, then:
+Source in `apps/pocketlens/` came from upstream `web/`, with the FuseBase scaffold's CLI-managed
+`package.json`/Vite settings retained and PocketLens dependencies merged in. Use the CLI for
+future edits/deploys:
 
 ```bash
 fusebase dev start
-fusebase deploy
+fusebase deploy --app pocketlens
 fusebase app list
 ```
-
-`fusebase app list` is the only reliable source for the live URL. Do not guess the subdomain.
