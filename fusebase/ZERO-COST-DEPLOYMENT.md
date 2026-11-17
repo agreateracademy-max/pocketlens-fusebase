@@ -1,79 +1,62 @@
-# Zero-cost hosting decision (verified 2026-11-17)
+# $0-Only Deployment Plan (2026-11-17)
 
-**Requirement: no payment method usage, no paid plan, no auto-upgrade.** This ADR supersedes the older Render-first assumption. Never configure a deployment that can generate charges. Use the existing GitHub fork as the sole source of truth and make feature changes there.
+**Hard requirement: no payments, no paid plans, no paid-tier fallbacks.** This document supersedes the Render-first plan. The GitHub repository remains the source of truth; deployment/runtime changes must be made in GitHub and remain reproducible from it.
 
-## Status
+## Verified current state
 
-- FuseBase frontend: live at `https://pocketlens.thefusebase.app/`.
-- Supabase project: live at `https://fuabnlnvapowqgerqljt.supabase.co`; 48 migrations applied.
-- Plaid backend: not yet deployed to an external provider.
-- No Plaid account credentials have been installed in production.
+- FuseBase frontend is live at https://pocketlens.thefusebase.app/.
+- Supabase project `pocketlens` (`fuabnlnvapowqgerqljt`) exists on Free; 48 SQL migrations applied.
+- No Plaid credential or transaction data has been configured in production.
+- PocketLens frontend calls a separate API for Link, credential management, sync requests, and Plaid webhook callbacks; it cannot work with only a static frontend.
 
-## Options evaluated
+## Candidate A: Cloudflare Workers Free — primary evaluation target
 
-### A. Cloudflare Workers Free — preferred first candidate, with code adaptation
+Cloudflare's current Free limits: 100,000 requests/day; 10 ms active CPU for **both HTTP and cron** invocations; 128 MB memory; 50 subrequests/invocation; 5 cron triggers/account; 15-minute wall-clock cron run. Awaiting HTTP I/O does not count as CPU. Python Workers use Pyodide; FastAPI works via Cloudflare's ASGI adapter, but Python `threading`/`multiprocessing` are nonfunctional. Python packages must resolve against Pyodide/PyEmscripten wheels.
 
-The current Cloudflare Free plan includes 100,000 requests/day; five Cron Triggers/account; 10 ms CPU per HTTP **and cron** invocation; 50 subrequests per invocation; 128 MB isolate memory; 15 minutes wall time for scheduled handlers. Waiting on network I/O does not consume CPU, so the strict limit is active CPU, not total elapsed API wait.
+### Actual compatibility experiment (local only)
 
-Cloudflare Python Workers are GA, run FastAPI via Cloudflare's ASGI adapter, and support Python packages only when Pyodide-compatible. Pyodide has no working threading/multiprocessing, and its filesystem is ephemeral. The worker needs one cron schedule for the API `scheduled()` handler and separate HTTP routes for Plaid Link API/webhooks. This avoids two physical external services.
+- FastAPI + Cloudflare ASGI Worker launched and returned `/health` successfully in local workerd.
+- The complete PocketLens API package tree was copied into a temporary fit-test, with its generated Plaid SDK source vendored (not modified in GitHub yet).
+- `pywrangler sync` fails on the upstream `plaid-python` dependency because it publishes no Pyodide wheel. Vendoring its generated ~38MB pure-Python client allowed its imports and an instance of its `PlaidApi` to initialize successfully. `cryptography` and `PyJWT` also imported/operated in the test.
+- With the Plaid SDK vendored and `urllib3` source vendored for this test only, the full FastAPI app booted and `/health` passed in the local Cloudflare runtime.
+- This is promising but is NOT a deployed/supported production backend yet. Full `/link/*`, `/sync`, `/webhook`, and cron tests have not passed.
 
-**Measured against this repo, not assumed:** FastAPI itself starts in a local Cloudflare Workers/Pyodide runtime. The full PocketLens `api.py` also imports and answers `/health` there once the Plaid SDK is vendored. But `pywrangler sync` rejects `plaid-python>=14` because it has no Pyodide wheel. In a disposable local fit-test only, the generated Plaid Python source was vendored and imported successfully; dependency-light `sync`, reconcile, HTTPX, Supabase, PyJWT and cryptography wheels resolved. This is an experiment, NOT a deployed/proven Cloudflare backend. The generated Plaid SDK package is about 38 MB source; with Pyodide and deps, local package/module inventory is about 55 MB, below the 64 MiB Worker code bundle limit in principle, but actual `pywrangler deploy --dry-run` and remote deployment are still required to confirm.
+### Primary remaining blocker: code relies on threads and sockets
 
-**Major known porting work:** PocketLens's API and all sync/reconcile/digest jobs use synchronous generated Plaid SDK calls, ThreadPools, `threading.local`, `threading.Lock`, and background-task/cron entry points. CPython `threading` and `multiprocessing` are nonfunctional on Workers/Pyodide. Merely importing/serving `/health` does not validate those flows. Refactor into an async Cloudflare Worker design: one durable HTTP operation per request/event, no threads, idempotent per-item transactions cursor sync, and paginate/checkpoint so individual CPU stays below 10 ms. Plaid transaction loops and ORM/Pydantic parsing are the first likely CPU hotspot; profile and measure at every stage. Do not weaken security to hit a quota.
+Upstream FastAPI endpoints and SDK operations use synchronous `plaid-python`, synchronous `supabase-py`, `BackgroundTasks`, and a per-thread Supabase client (`threading.local`). The Plaid generated client uses `multiprocessing.pool.ThreadPool`, `multiprocessing.cpu_count`, and urllib3. Cloudflare Python Workers do not have working threads or multiprocessing; blocking synchronous request libraries are not production-safe without compatibility verification. CPython thread-local client pooling cannot be relied on in one isolate serving concurrent async requests.
 
-Potential further work: keep the React SPA on FuseBase, or put it on Cloudflare Pages if we later choose one static host; preserve Supabase GoTrue/PostgREST/RLS and current schema. Do not redesign the data layer just to chase hosting.
+**Plan:** use GitHub as base and make the minimal Cloudflare-specific port:
 
-### B. FuseBase hosted Node backend — only if confirmed included at $0 marginal cost
+1. Preserve upstream logic and tests under `legacy/` or an explicit branch; do not discard existing behavior.
+2. Create a Cloudflare Python Worker using FastAPI (or direct Worker handlers) with actual async HTTP via `httpx`/Fetch for Plaid REST and Supabase PostgREST. Reuse data rules/SQL/RLS; do not expose service-role or Plaid secrets to the SPA.
+3. Replace thread-local/global clients and ThreadPool with per-request or task-local context; no shared user secrets/state in module globals.
+4. Add authenticated endpoints for Plaid Link token creation, token exchange, personal credential CRUD, item unlink/backfill, plus signed Plaid webhook handling. Persist access tokens encrypted at rest and verify Plaid webhook JWT as upstream does.
+5. Make the cron handler incremental-only and idempotent: one account/item per short invocation; checkpoint cursors; queue/chunk/retry. A 10ms CPU cap applies per call, so schedule frequent small chunks rather than a monolithic full reconciliation. Keep full-window reconciliation manual or split into bounded pages only after proving CPU fits.
+6. Run a Sandbox test sequence against the existing 48 migrations: login/user isolation, credential encryption roundtrip, Link token, public-token exchange, one `transactions/sync` page, duplicate webhook, and rerun idempotency. Measure CPU; do not enable production Plaid or say it is deployed until all pass.
+7. Deploy only using Cloudflare Free features. Keep billing alerts/spending protections on; never switch to Workers Paid ($5+).
 
-The live FuseBase project's own coding rules confirm backend apps, independent cron job containers, server secrets, and CLI deployment. The organization's 20-code AppSumo evidence quotes 25 active full-stack apps, alongside 200 frontend apps. The account-specific plan notes do **not** prove current per-invocation/per-container costs, resource entitlements, included full-stack eligibility, or whether active PocketLens full-stack app capacity is unused. FuseBase's public guide says backend apps cost more; the AppSumo partner answers are historical/ambiguous about pricing. **No backend or cron should be deployed until the FuseBase account UI/vendor explicitly confirms $0 additional charge on this exact organization/deal.**
+Since upstream `plaid-python` has no Pyodide wheel, a vendored SDK is an experimental option but may be large/brittle; the better long-term adaptation is using the generated OpenAPI models while replacing the HTTP transport with Web APIs/async fetch or a proven compatible HTTP client. Make updates reproducible and test against Plaid's current API.
 
-A FuseBase backend is Node, not Python. The GitHub source would need a deliberate TypeScript/Plaid API port, and the environment should be tested before any paid slot is consumed.
+## Candidate B: FuseBase hosted backend — conditional, not yet confirmed $0
 
-### C. Supabase Edge Functions + Supabase Cron — not a zero-cost fit for full sync
+Our account-specific 20-code document reports 25 active full-stack apps; the backend docs and local FuseBase CLI instructions show Node backend jobs/secrets. But the vendor docs say backend apps cost more and the 20-code evidence does not explicitly establish no incremental runtime bill for THIS account. **Do not deploy/activate a FuseBase backend until the account's actual billing UI or written vendor terms confirm $0 incremental cost.** It also requires porting ~the entire Python/Plaid backend to Node.
 
-The existing Supabase project is Free; its documented Edge Function caps are 2 seconds CPU and 150 seconds wall time, 256 MB memory. Cron may schedule SQL or HTTP function invocations. That may work for small orchestration/wake-ups, but not established safe for PocketLens full multi-page sync/reconcile across all banks. Also Free projects pause for low database activity over 7 days, and user activity must be generated by app/database requests. This can be kept active by real app usage, but is not suitable to promise continuous finance sync unattended without validated traffic. Supabase Edge Function invocation quota (500k/month) does not equal enough runtime/CPU for the job.
+## Candidate C: Supabase Edge Functions + Supabase Cron — possible orchestrator, unlikely full sync
 
-### D. GitHub Actions scheduler + external compute — limited bridge only
+Supabase Free includes 500k Edge Function invocations/month and Postgres Cron can call functions, but Free Edge Functions cap at 2s active CPU, 150s wall time, 256 MB memory. The current database has `pg_cron`/`pg_net` extensions absent (confirmed via read-only SQL), so scheduler plumbing must be enabled/installed/tested. Supabase Free projects pause after 7 days of low user DB activity; a scheduled `pg_cron` internal job alone may not count as user traffic. Need confirm keepalive semantics. Functions can host small API/webhook handlers or orchestrate chunks, but require the same TypeScript port and finite per-call limits. Do not rely on a cron trigger keeping the DB active.
 
-GitHub-hosted runner usage is free/unlimited only for public repositories; the fork is public. But a scheduled job running the complete backend still needs a reliable inbound API (to serve Plaid Link/webhooks) and persistent/secret handling. Schedules in public repos can be auto-disabled after 60 days without repository activity. GitHub Actions is suitable as a free daily **orchestrator/maintenance** only if made idempotent and the public-source/security tradeoffs are acceptable; do not expose secrets or private data in logs/artifacts. It does not itself solve long-lived HTTP endpoints, serverless cold starts or secure webhook uptime.
+## Candidate D: GitHub Actions — free scheduler only if public repo, not the Plaid API host
 
-### E. Render — reject for this $0-only requirement
+GitHub-hosted runners are free for public repositories; usage for private repos depends on plan. Scheduled jobs can run the incremental sync but do not provide an always-on API endpoint for Link redirects/webhooks. Public repositories' scheduled workflows may disable after 60 days of inactivity. Publishing the fork creates a public-source/privacy tradeoff (no secrets/data in Git); evaluate before use.
 
-Render Free web services may sleep after 15 minutes and get 750 free instance hours/month; free PostgreSQL expires after 30 days. Crucially, Render Cron Jobs are not free and have a $1/month minimum. It fails the explicit hard-zero-cost rule even though a free web service exists.
+## Rejected: Render for the $0-only rule
 
-## Recommended architecture
+Render Free Web Services spin down after 15 minutes, receive 750 instance hours/month, and external API traffic may trigger suspension. Render Cron Jobs are not free and have a $1/month minimum. Therefore, do not use Render for this project while the $0 rule is in force.
 
-1. Keep current FuseBase-hosted SPA as shipped and Supabase project as the database/auth/RLS layer.
-2. Use the public GitHub fork as the only source. Create a dedicated `cloudflare-worker` deployment target; do not distort the FuseBase native app project.
-3. First test the public Plaid API endpoints with Python Worker package compatibility (Plaid client fork/vendoring or a small async HTTP adapter) and validate Link token create/exchange, one Sandbox transaction sync page, and webhook verification.
-4. Migrate sync, reconcile and digests to an async, cursor-checkpointed scheduled workflow with a strict 10ms per-invocation CPU budget; leave full reconciliation infrequent/manual unless it proves below budget. Cron is UTC; API requests waiting on Plaid/Supabase I/O are not CPU-bound, but Python/Pydantic transforms still count.
-5. Gate each rollout with: pywrangler dependency lock success, local Worker tests, CPU+memory instrumentation, idempotency/duplicate-webhook tests, RLS tenant-isolation tests, and deploy-time compatibility checks. If a needed package cannot run without a paid runtime, stop and simplify/replace it; never silently switch to paid.
-6. Keep public Plaid webhook handling authenticated/verified (Plaid JWT validation) and secrets exclusively in Cloudflare encrypted Worker secrets. Never bundle Supabase service role, Fernet key or Plaid secret into the browser build.
+## Decision
 
-## Verification checklist before calling it live
-
-- Cloudflare account plan and existing Worker inventory checked (after account access is connected).
-- `uv run pywrangler sync` and `wrangler deploy --dry-run` succeed from the GitHub-targeted worker project.
-- `GET /health`, sandbox Link token, public-token exchange, incremental sync, scheduled job, webhook signature, retry/idempotency and RLS denial paths tested.
-- Every job's observed CPU is <10ms; no thread or subprocess runtime path; each cron returns within 15m wall time.
-- Account shows Free plan; no paid tier or billing resource is activated; set budget/spending controls if available.
-- Supabase free project pause behavior and app-use keepalive measured; ensure true real daily user traffic or record that pause risk remains.
-
-## Sources
-
-- Cloudflare limits: https://developers.cloudflare.com/workers/platform/limits/
-- Cloudflare pricing: https://developers.cloudflare.com/workers/platform/pricing/
-- Cloudflare Python: https://developers.cloudflare.com/workers/languages/python/
-- Cloudflare Python packages: https://developers.cloudflare.com/workers/languages/python/packages/
-- Cloudflare FastAPI: https://developers.cloudflare.com/workers/languages/python/packages/fastapi/
-- Cloudflare Cron: https://developers.cloudflare.com/workers/configuration/cron-triggers/
-- Supabase Edge Function limits: https://supabase.com/docs/guides/functions/limits
-- Supabase Free pausing: https://supabase.com/docs/guides/platform/free-project-pausing
-- GitHub Actions billing: https://docs.github.com/en/actions/concepts/billing-and-usage
-- Render Free: https://render.com/docs/free
-- Render Cron pricing: https://render.com/docs/cronjobs
-- FuseBase 20-code plan evidence: https://docs.google.com/document/d/1wMM-YtZQkxwNXzInJ4Xgq0cjh-TDu6P3e2Qx8Gzhsk4/edit
+Cloudflare Workers Free is the best candidate because the user already has Cloudflare, it supports FastAPI/Python with a 10ms CPU cap, and the GitHub base can be adapted. The next engineering task is a narrowly scoped test branch: prove one async Plaid Sandbox link-token call, one webhook signature validation, and one small data-sync page in the deployed Worker, then inspect CPU. Keep FuseBase frontend + Supabase Free data/Auth. The complete live product is **not yet connected to Plaid**.
 
 ## Change log
 
-2026-11-17: Initial zero-payment review. Render rejected for cron minimum charge. Cloudflare Python Workers tested with full FastAPI import and `/health`, using an out-of-tree vendor-only fit fixture; full sync not yet ported or deployed. Need verify Cloudflare account access and FuseBase's exact included app hosting entitlement before runtime decisions.
+2026-11-17 — Initial $0-only alternatives review: read official Cloudflare/Supabase/Render docs, inspected account plan note and upstream requirements, locally confirmed FastAPI boot and imported Plaid generated code after experimental vendoring; no hosted Cloudflare deployment was made. New test branch/task needed for actual async/non-threaded port and remote validation.
